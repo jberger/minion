@@ -1,53 +1,96 @@
-package Minion;
-use Mojo::Base 'Mojo::EventEmitter';
+package Minion::Mango;
+use Mojo::Base 'Minion';
 
-use Minion::Job;
-use Minion::Worker;
+use Mango;
+use Mango::BSON 'bson_time';
+use Minion::Job::Mango;
+use Minion::Worker::Mango;
 use Mojo::Server;
+use Scalar::Util 'weaken';
+use Sys::Hostname 'hostname';
 
 our $VERSION = '0.10';
 
-has app => sub { Mojo::Server->new->build_app('Mojo::HelloWorld') };
-has [qw(auto_perform storage)];
-has jobs => sub { die 'Not implemented' };
-has job_class => 'Minion::Job';
-has prefix => 'minion';
-has tasks => sub { {} };
-has workers => sub { die 'Not implemented' };
-has worker_class => 'Minion::Worker';
+has jobs => sub { $_[0]->storage->db->collection($_[0]->prefix . '.jobs') };
+has job_class => 'Minion::Job::Mango';
+has workers =>
+  sub { $_[0]->storage->db->collection($_[0]->prefix . '.workers') };
+has worker_class => 'Minion::Worker::Mango';
 
-sub add_task {
-  my ($self, $name, $cb) = @_;
-  $self->tasks->{$name} = $cb;
+sub enqueue {
+  my ($self, $task) = (shift, shift);
+  my $cb = ref $_[-1] eq 'CODE' ? pop : undef;
+  my $args    = shift // [];
+  my $options = shift // {};
+
+  my $doc = {
+    args     => $args,
+    created  => bson_time,
+    delayed  => $options->{delayed} // bson_time(1),
+    priority => $options->{priority} // 0,
+    state    => 'inactive',
+    task     => $task
+  };
+
+  # Blocking
+  unless ($cb) {
+    my $oid = $self->jobs->insert($doc);
+    $self->_perform;
+    return $oid;
+  }
+
+  # Non-blocking
+  weaken $self;
+  return $self->jobs->insert($doc => sub { shift; $self->_perform->$cb(@_) });
+}
+
+sub job {
+  my ($self, $oid) = @_;
+
+  return undef
+    unless my $job = $self->jobs->find_one($oid, {args => 1, task => 1});
+  return Minion::Job->new(
+    args   => $job->{args},
+    id     => $job->{_id},
+    minion => $self,
+    task   => $job->{task}
+  );
+}
+
+sub new { shift->SUPER::new(storage => Mango->new(@_)) }
+
+sub repair {
+  my $self = shift;
+
+  # Check workers on this host (all should be owned by the same user)
+  my $workers = $self->workers;
+  my $cursor = $workers->find({host => hostname});
+  while (my $worker = $cursor->next) {
+    $workers->remove({_id => $worker->{_id}}) unless kill 0, $worker->{pid};
+  }
+
+  # Abandoned jobs
+  my $jobs = $self->jobs;
+  $cursor = $jobs->find({state => 'active'});
+  while (my $job = $cursor->next) {
+    $jobs->save({%$job, state => 'failed', error => 'Worker went away.'})
+      unless $workers->find_one($job->{worker});
+  }
+
   return $self;
 }
 
-sub enqueue { die 'Not implemented' }
-
-sub job { die 'Not implemented' }
-
-sub repair { die 'Not implemented' }
-
-sub stats { die 'Not implemented' }
-
-sub worker {
-  my $self = shift;
-  my $worker = $self->worker_class->new(minion => $self);
-  $self->emit(worker => $worker);
-  return $worker;
-}
-
-sub _perform {
+sub stats {
   my $self = shift;
 
-  # No recursion
-  return $self if !$self->auto_perform || $self->{lock};
-  local $self->{lock} = 1;
-
-  my $worker = $self->worker->register;
-  while (my $job = $worker->dequeue) { $job->perform }
-  $worker->unregister;
-  return $self;
+  my $jobs    = $self->jobs;
+  my $active  = @{$jobs->find({state => 'active'})->distinct('worker')};
+  my $workers = $self->workers;
+  my $all     = $workers->find->count;
+  my $stats = {active_workers => $active, inactive_workers => $all - $active};
+  $stats->{"${_}_jobs"} = $jobs->find({state => $_})->count
+    for qw(active failed finished inactive);
+  return $stats;
 }
 
 1;

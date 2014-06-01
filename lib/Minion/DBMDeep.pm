@@ -1,53 +1,102 @@
-package Minion;
-use Mojo::Base 'Mojo::EventEmitter';
+package Minion::DBMDeep;
+use Mojo::Base 'Minion';
 
-use Minion::Job;
-use Minion::Worker;
-use Mojo::Server;
+use DBM::Deep;
+use Mango::BSON qw'bson_oid bson_time';
+use Mojo::Collection 'c';
+use Minion::Job::DBMDeep;
+use Minion::Worker::DBMDeep;
+use Scalar::Util 'weaken';
+use Sys::Hostname 'hostname';
 
 our $VERSION = '0.10';
 
-has app => sub { Mojo::Server->new->build_app('Mojo::HelloWorld') };
-has [qw(auto_perform storage)];
-has jobs => sub { die 'Not implemented' };
-has job_class => 'Minion::Job';
-has prefix => 'minion';
-has tasks => sub { {} };
-has workers => sub { die 'Not implemented' };
-has worker_class => 'Minion::Worker';
+has jobs => sub { $_[0]->storage->{$_[0]->prefix . '.jobs'} };
+has job_class => 'Minion::Job::DBMDeep';
+has workers =>
+  sub { $_[0]->storage->{$_[0]->prefix . '.workers'} };
+has worker_class => 'Minion::Worker::DBMDeep';
 
-sub add_task {
-  my ($self, $name, $cb) = @_;
-  $self->tasks->{$name} = $cb;
+sub enqueue {
+  my ($self, $task) = (shift, shift);
+  my $cb = ref $_[-1] eq 'CODE' ? pop : undef;
+  my $args    = shift // [];
+  my $options = shift // {};
+
+  my $doc = {
+    args     => $args,
+    created  => bson_time,
+    delayed  => $options->{delayed} // bson_time(1),
+    priority => $options->{priority} // 0,
+    state    => 'inactive',
+    task     => $task
+  };
+
+  # Blocking
+  unless ($cb) {
+    my $oid = bson_oid->to_string;
+    $doc->{_id} => $oid;
+    $self->jobs->{$oid} = $doc;
+    $self->_perform;
+    return $oid;
+  }
+
+  return; # no non-blocking yet
+
+  # Non-blocking
+  # weaken $self;
+  # return $self->jobs->insert($doc => sub { shift; $self->_perform->$cb(@_) });
+}
+
+sub job {
+  my ($self, $oid) = @_;
+
+  return undef
+    unless my $job = $self->jobs->{$oid};
+  return self->job_class->new(
+    args   => $job->{args},
+    id     => $job->{_id},
+    minion => $self,
+    task   => $job->{task}
+  );
+}
+
+sub new { shift->SUPER::new(storage => DBM::Deep->new(@_)) }
+
+sub repair {
+  my $self = shift;
+
+  # Check workers on this host (all should be owned by the same user)
+  my $workers = $self->workers;
+  my @w = grep { $_->{host} eq hostname } values %$workers;
+  for my $worker (@w) {
+    delete $workers->{$worker->{_id}} unless kill 0, $worker->{pid};
+  }
+
+  # Abandoned jobs
+  my $jobs = $self->jobs;
+  $cursor = $jobs->find({state => 'active'});
+  my @j = grep { $_->{state} eq 'active' } values %$jobs;
+  for my $job (@j) {
+    @{ $jobs->{$job->{_id}} }{qw/state error/} = ('failed', 'Worker went away.')
+      unless $workers->{$job->{worker}};
+  }
+
   return $self;
 }
 
-sub enqueue { die 'Not implemented' }
-
-sub job { die 'Not implemented' }
-
-sub repair { die 'Not implemented' }
-
-sub stats { die 'Not implemented' }
-
-sub worker {
-  my $self = shift;
-  my $worker = $self->worker_class->new(minion => $self);
-  $self->emit(worker => $worker);
-  return $worker;
-}
-
-sub _perform {
+sub stats {
   my $self = shift;
 
-  # No recursion
-  return $self if !$self->auto_perform || $self->{lock};
-  local $self->{lock} = 1;
-
-  my $worker = $self->worker->register;
-  while (my $job = $worker->dequeue) { $job->perform }
-  $worker->unregister;
-  return $self;
+  my $jobs    = c(values %{$self->jobs});
+  my $active  = $jobs->grep(sub{$_->{state} eq 'active'})->map(sub{$_->{worker}})->uniq->count;
+  my $workers = $self->workers;
+  my $all     = values %$workers;
+  my $stats = {active_workers => $active, inactive_workers => $all - $active};
+  for my $state (qw(active failed finished inactive) {)
+    $stats->{"${state}_jobs"} = $jobs->grep(sub{$_->{state} eq $state})->count;
+  }
+  return $stats;
 }
 
 1;
